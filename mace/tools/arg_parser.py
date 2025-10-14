@@ -743,13 +743,37 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         help="Optimizer for parameter optimization",
         type=str,
         default="adam",
-        choices=["adam", "adamw", "schedulefree"],
+        choices=["adam", "adamw", "schedulefree", "muon"],
     )
     parser.add_argument(
         "--beta",
         help="Beta parameter for the optimizer",
         type=float,
         default=0.9,
+    )
+    parser.add_argument(
+        "--muon_momentum",
+        help="Momentum coefficient for the Muon optimizer",
+        type=float,
+        default=0.95,
+    )
+    parser.add_argument(
+        "--muon_beta2",
+        help="Second beta for the Muon auxiliary Adam optimizer",
+        type=float,
+        default=0.95,
+    )
+    parser.add_argument(
+        "--muon_eps",
+        help="Epsilon value for the Muon auxiliary Adam optimizer",
+        type=float,
+        default=1e-10,
+    )
+    parser.add_argument(
+        "--muon_ns_steps",
+        help="Number of Newton-Schulz iterations for Muon",
+        type=int,
+        default=5,
     )
     parser.add_argument("--batch_size", help="batch size", type=int, default=10)
     parser.add_argument(

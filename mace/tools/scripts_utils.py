@@ -21,6 +21,7 @@ from torch.optim.swa_utils import SWALR, AveragedModel
 
 from mace import data, modules, tools
 from mace.data import KeySpecification
+from mace.tools.optimizers import MuonWithAdam, build_muon_param_groups
 from mace.tools.train import SWAContainer
 
 
@@ -847,6 +848,19 @@ def get_optimizer(
             ) from exc
         _param_options = {k: v for k, v in param_options.items() if k != "amsgrad"}
         optimizer = adamw_schedulefree.AdamWScheduleFree(**_param_options)
+    elif args.optimizer == "muon":
+        momentum = getattr(args, "muon_momentum", 0.95)
+        beta2 = getattr(args, "muon_beta2", 0.95)
+        eps = getattr(args, "muon_eps", 1e-10)
+        ns_steps = getattr(args, "muon_ns_steps", 5)
+
+        muon_ready_groups = build_muon_param_groups(
+            param_options["params"],
+            momentum=momentum,
+            betas=(args.beta, beta2),
+            eps=eps,
+        )
+        optimizer = MuonWithAdam(muon_ready_groups, ns_steps=ns_steps)
     else:
         optimizer = torch.optim.Adam(**param_options)
     return optimizer
