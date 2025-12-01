@@ -835,8 +835,21 @@ def get_params_options(
 
 
 def get_optimizer(
-    args: argparse.Namespace, param_options: Dict[str, Any]
+    args: argparse.Namespace,
+    param_options: Dict[str, Any],
+    model: Optional[torch.nn.Module] = None,
 ) -> torch.optim.Optimizer:
+    """
+    Create an optimizer based on the arguments.
+
+    Args:
+        args: Command line arguments
+        param_options: Parameter options dict with 'params' and other optimizer settings
+        model: The model (needed for Muon optimizer to properly handle e3nn layers)
+
+    Returns:
+        The configured optimizer
+    """
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(**param_options)
     elif args.optimizer == "schedulefree":
@@ -856,6 +869,7 @@ def get_optimizer(
 
         muon_ready_groups = build_muon_param_groups(
             param_options["params"],
+            model=model,
             momentum=momentum,
             betas=(args.beta, beta2),
             eps=eps,
