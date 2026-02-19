@@ -11,7 +11,15 @@ from e3nn import o3
 from mace import data, modules, tools
 from mace.data import Configuration
 from mace.tools import torch_geometric
-from mace.modules.lora import inject_lora, merge_lora_weights
+from mace.modules.lora import LoRAO3Linear, inject_lora, merge_lora_weights
+
+try:
+    import cuequivariance as cue  # noqa: F401
+    import cuequivariance_torch as cuet
+
+    CUET_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    CUET_AVAILABLE = False
 
 
 def _random_config() -> Configuration:
@@ -373,3 +381,198 @@ def test_lora_evaluate_preserves_frozen_state(build_lora_model, random_configs) 
         assert not lora_params_after[
             name
         ], f"Base param {name} should still be frozen after evaluate()"
+
+
+# ---------------------------------------------------------------------------
+# cueq + LoRA tests
+# ---------------------------------------------------------------------------
+
+
+def _build_scaleshiftmace() -> Tuple[modules.ScaleShiftMACE, tools.AtomicNumberTable]:
+    """Build a ScaleShiftMACE model (required for cueq conversion)."""
+    table = tools.AtomicNumberTable([1, 6])
+    model = modules.ScaleShiftMACE(
+        r_max=4.5,
+        num_bessel=4,
+        num_polynomial_cutoff=3,
+        max_ell=1,
+        interaction_cls=modules.interaction_classes[
+            "RealAgnosticResidualInteractionBlock"
+        ],
+        interaction_cls_first=modules.interaction_classes[
+            "RealAgnosticResidualInteractionBlock"
+        ],
+        num_interactions=2,
+        num_elements=2,
+        hidden_irreps=o3.Irreps("16x0e + 16x1o"),
+        MLP_irreps=o3.Irreps("16x0e"),
+        gate=torch.nn.functional.silu,
+        atomic_energies=np.random.normal(scale=0.1, size=len(table.zs)),
+        avg_num_neighbors=6.0,
+        atomic_numbers=table.zs,
+        correlation=2,
+        radial_type="bessel",
+        atomic_inter_scale=1.0,
+        atomic_inter_shift=0.0,
+        use_reduced_cg=False,
+    )
+    return model, table
+
+
+@pytest.fixture(name="build_cueq_lora_model")
+def _build_cueq_lora_model_fixture() -> (
+    Callable[[int, float, bool], Tuple[modules.ScaleShiftMACE, tools.AtomicNumberTable]]
+):
+    """Factory that builds a cueq ScaleShiftMACE model with LoRA injected."""
+
+    def _builder(
+        rank: int = 2,
+        alpha: float = 0.5,
+        randomize: bool = True,
+    ) -> Tuple[modules.ScaleShiftMACE, tools.AtomicNumberTable]:
+        from mace.cli.convert_e3nn_cueq import run as run_e3nn_to_cueq
+
+        model, table = _build_scaleshiftmace()
+        model = run_e3nn_to_cueq(model, device="cpu")
+        cueq_config = getattr(model.products[0], "cueq_config", None)
+        inject_lora(model, rank=rank, alpha=alpha, cueq_config=cueq_config)
+        if randomize:
+            _randomize_lora_parameters(model)
+        return model, table
+
+    return _builder
+
+
+@pytest.mark.skipif(not CUET_AVAILABLE, reason="cuequivariance not installed")
+def test_cueq_lora_trainable_parameter_count(build_cueq_lora_model) -> None:
+    model, _ = build_cueq_lora_model(rank=2, alpha=0.5, randomize=True)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    expected = sum(p.numel() for name, p in model.named_parameters() if "lora_" in name)
+    assert trainable == expected
+
+    non_lora_trainable = [
+        name
+        for name, p in model.named_parameters()
+        if "lora_" not in name and p.requires_grad
+    ]
+    assert (
+        not non_lora_trainable
+    ), f"Non-LoRA parameters trainable: {non_lora_trainable}"
+
+
+@pytest.mark.skipif(not CUET_AVAILABLE, reason="cuequivariance not installed")
+def test_cueq_lora_merge_preserves_outputs(
+    build_cueq_lora_model, random_configs
+) -> None:
+    model, table = build_cueq_lora_model(rank=2, alpha=0.5, randomize=True)
+    model.eval()
+
+    configs = list(random_configs)
+    energy_before, forces_before = _forward_energy_forces(model, configs, table)
+
+    merge_lora_weights(model)
+    model.eval()
+
+    energy_after, forces_after = _forward_energy_forces(model, configs, table)
+
+    assert torch.allclose(
+        energy_before, energy_after, rtol=1e-5, atol=1e-6
+    ), f"Energy mismatch after merge: {energy_before} vs {energy_after}"
+    assert torch.allclose(
+        forces_before, forces_after, rtol=1e-5, atol=1e-6
+    ), f"Forces mismatch after merge: max diff = {(forces_before - forces_after).abs().max()}"
+
+
+@pytest.mark.skipif(not CUET_AVAILABLE, reason="cuequivariance not installed")
+def test_cueq_lora_merge_removes_wrappers(build_cueq_lora_model) -> None:
+    from mace.modules.lora import LoRADenseLinear, LoRAFCLayer, LoRAO3Linear
+
+    model, _ = build_cueq_lora_model(rank=2, alpha=0.5, randomize=True)
+
+    wrappers_before = sum(
+        1
+        for m in model.modules()
+        if isinstance(m, (LoRADenseLinear, LoRAFCLayer, LoRAO3Linear))
+    )
+    assert wrappers_before > 0, "Model should have LoRA wrappers before merge"
+
+    merge_lora_weights(model)
+
+    wrappers_after = sum(
+        1
+        for m in model.modules()
+        if isinstance(m, (LoRADenseLinear, LoRAFCLayer, LoRAO3Linear))
+    )
+    assert wrappers_after == 0, (
+        f"Model still has {wrappers_after} LoRA wrappers after merge"
+    )
+
+    has_cuet_linear = any(
+        isinstance(m, cuet.Linear)
+        for m in model.modules()
+    )
+    assert has_cuet_linear, (
+        "After merging on a cueq model, base cuet.Linear modules should remain"
+    )
+
+
+@pytest.mark.skipif(not CUET_AVAILABLE, reason="cuequivariance not installed")
+def test_cueq_lora_equivariance(build_cueq_lora_model, random_configs) -> None:
+    model, table = build_cueq_lora_model(rank=2, alpha=0.5, randomize=True)
+    model.eval()
+    base_cfg = random_configs[0]
+
+    energy, forces = _forward_energy_forces(model, [base_cfg], table)
+    energy_val = energy.item()
+    forces_val = forces.squeeze(0).detach().numpy()
+
+    R = _rotation_matrix()
+    rotated_cfg = _rotate_config(base_cfg, R)
+    energy_rot, forces_rot = _forward_energy_forces(model, [rotated_cfg], table)
+    assert np.allclose(energy_rot.item(), energy_val, rtol=1e-5, atol=1e-5)
+    assert np.allclose(
+        forces_val @ R.T,
+        forces_rot.squeeze(0).detach().numpy(),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+    shift = np.array([0.17, -0.05, 0.08])
+    translated_cfg = _translate_config(base_cfg, shift)
+    energy_trans, forces_trans = _forward_energy_forces(model, [translated_cfg], table)
+    assert np.allclose(energy_trans.item(), energy_val, rtol=1e-5, atol=1e-5)
+    assert np.allclose(
+        forces_trans.squeeze(0).detach().numpy(), forces_val, rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.skipif(not CUET_AVAILABLE, reason="cuequivariance not installed")
+def test_cueq_lora_forward_matches_e3nn(random_configs) -> None:
+    """cueq+LoRA model produces the same outputs as e3nn+LoRA model."""
+    from mace.cli.convert_e3nn_cueq import run as run_e3nn_to_cueq
+
+    torch.manual_seed(42)
+    model_e3nn, table = _build_scaleshiftmace()
+
+    model_cueq = run_e3nn_to_cueq(model_e3nn, device="cpu")
+    cueq_config = getattr(model_cueq.products[0], "cueq_config", None)
+
+    torch.manual_seed(123)
+    inject_lora(model_e3nn, rank=2, alpha=0.5)
+
+    torch.manual_seed(123)
+    inject_lora(model_cueq, rank=2, alpha=0.5, cueq_config=cueq_config)
+
+    model_e3nn.eval()
+    model_cueq.eval()
+
+    configs = list(random_configs)
+    energy_e3nn, forces_e3nn = _forward_energy_forces(model_e3nn, configs, table)
+    energy_cueq, forces_cueq = _forward_energy_forces(model_cueq, configs, table)
+
+    assert torch.allclose(
+        energy_e3nn, energy_cueq, rtol=1e-4, atol=1e-5
+    ), f"Energy mismatch: e3nn={energy_e3nn} cueq={energy_cueq}"
+    assert torch.allclose(
+        forces_e3nn, forces_cueq, rtol=1e-4, atol=1e-5
+    ), f"Forces max diff = {(forces_e3nn - forces_cueq).abs().max()}"

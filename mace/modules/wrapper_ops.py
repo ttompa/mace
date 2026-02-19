@@ -91,7 +91,6 @@ class Linear:
                 cue.Irreps(cueq_config.group, irreps_out),
                 layout=cueq_config.layout,
                 shared_weights=shared_weights,
-                method="naive",
             )
 
         return o3.Linear(
@@ -256,7 +255,6 @@ class FullyConnectedTensorProduct:
                 layout=cueq_config.layout,
                 shared_weights=shared_weights,
                 internal_weights=internal_weights,
-                method="naive",
             )
 
         return o3.FullyConnectedTensorProduct(
