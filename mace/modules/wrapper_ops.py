@@ -86,13 +86,17 @@ class Linear:
             and cueq_config.enabled
             and (cueq_config.optimize_all or cueq_config.optimize_linear)
         ):
-            return cuet.Linear(
+            module = cuet.Linear(
                 cue.Irreps(cueq_config.group, irreps_in),
                 cue.Irreps(cueq_config.group, irreps_out),
                 layout=cueq_config.layout,
                 shared_weights=shared_weights,
                 method="naive",
             )
+            module._o3_irreps_in = o3.Irreps(irreps_in)
+            module._o3_irreps_out = o3.Irreps(irreps_out)
+            module._cueq_layout_str = cueq_config.layout_str
+            return module
 
         return o3.Linear(
             irreps_in,
