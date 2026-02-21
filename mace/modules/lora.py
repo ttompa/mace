@@ -7,6 +7,16 @@ from e3nn.nn._fc import _Layer as E3NNFCLayer
 from torch import nn
 
 
+def _is_cueq_linear(module: nn.Module) -> bool:
+    """Duck-type check for cuequivariance_torch Linear modules."""
+    return (
+        module.__class__.__module__.startswith("cuequivariance_torch")
+        and hasattr(module, "weight")
+        and hasattr(module, "irreps_in")
+        and hasattr(module, "irreps_out")
+    )
+
+
 def build_lora_irreps(
     irreps_in: o3.Irreps, irreps_out: o3.Irreps, rank: int
 ) -> o3.Irreps:
@@ -34,6 +44,8 @@ class LoRAO3Linear(nn.Module):
 
     def __init__(self, base_linear: o3.Linear, rank: int = 4, alpha: float = 1.0):
         super().__init__()
+        if not isinstance(base_linear, o3.Linear):
+            raise TypeError("LoRAO3Linear requires an e3nn o3.Linear base layer")
         self.base = base_linear
         self.irreps_in = self.base.irreps_in
         self.irreps_out = self.base.irreps_out
@@ -147,6 +159,65 @@ class LoRAO3Linear(nn.Module):
         """Permanently merge LoRA weights into base and return the base layer."""
         with torch.no_grad():
             self.base.weight.copy_(self.compute_merged_weight())
+        return self.base
+
+
+class LoRACuEquivarianceLinear(nn.Module):
+    """LoRA wrapper for cuequivariance linear layers with internal weights."""
+
+    def __init__(self, base_linear: nn.Module, rank: int = 4, alpha: float = 1.0):
+        super().__init__()
+        if not _is_cueq_linear(base_linear):
+            raise TypeError("LoRACuEquivarianceLinear requires a cueq linear module")
+        if not hasattr(base_linear, "weight"):
+            raise TypeError("LoRACuEquivarianceLinear requires a 'weight' parameter")
+        if int(rank) <= 0:
+            raise ValueError("rank must be a positive integer")
+
+        self.base = base_linear
+        self.irreps_in = o3.Irreps(str(self.base.irreps_in))
+        self.irreps_out = o3.Irreps(str(self.base.irreps_out))
+        self.scaling = float(alpha) / float(rank)
+
+        w = self.base.weight  # cueq weight is a 2D trainable tensor
+        if w.dim() != 2:
+            raise ValueError(
+                f"Expected cueq linear weight to be 2D, got shape {tuple(w.shape)}"
+            )
+        self._weight_shape = tuple(w.shape)
+        self.lora_A = nn.Parameter(torch.empty(w.shape[0], rank, device=w.device, dtype=w.dtype))
+        self.lora_B = nn.Parameter(torch.empty(rank, w.shape[1], device=w.device, dtype=w.dtype))
+        self._cached_delta: torch.Tensor | None = None
+
+        with torch.no_grad():
+            nn.init.normal_(self.lora_A, mean=0.0, std=1e-3)
+            nn.init.zeros_(self.lora_B)
+
+    def compute_delta(self) -> torch.Tensor:
+        return self.lora_A @ self.lora_B
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if torch.is_grad_enabled():
+            self._cached_delta = None
+            delta = self.compute_delta()
+        else:
+            if self._cached_delta is None:
+                self._cached_delta = self.compute_delta()
+            delta = self._cached_delta
+
+        merged_weight = self.base.weight + self.scaling * delta
+        w_orig = self.base.weight
+        del self.base._parameters["weight"]  # pylint: disable=protected-access
+        self.base.weight = merged_weight
+        try:
+            return self.base(x)
+        finally:
+            self.base.weight = w_orig
+            self.base._parameters["weight"] = w_orig  # pylint: disable=protected-access
+
+    def merge_into_base(self) -> nn.Module:
+        with torch.no_grad():
+            self.base.weight.add_(self.scaling * self.compute_delta())
         return self.base
 
 
@@ -285,7 +356,9 @@ def inject_lora(
     """Recursively replace eligible linears with LoRA-wrapped versions."""
     for child_name, child in list(module.named_children()):
         # Skip already wrapped
-        if isinstance(child, (LoRAO3Linear, LoRADenseLinear, LoRAFCLayer)):
+        if isinstance(
+            child, (LoRAO3Linear, LoRACuEquivarianceLinear, LoRADenseLinear, LoRAFCLayer)
+        ):
             continue
         # Equivariant o3.Linear
         if wrap_equivariant and isinstance(child, o3.Linear):
@@ -294,6 +367,12 @@ def inject_lora(
             except ValueError:  # If no shared irreps, skip
                 continue
             setattr(module, child_name, wrapped)
+            continue
+        # Equivariant cueq Linear
+        if wrap_equivariant and _is_cueq_linear(child):
+            wrapped = LoRACuEquivarianceLinear(child, rank=rank, alpha=alpha)
+            setattr(module, child_name, wrapped)
+            continue
         # Dense nn.Linear
         if wrap_dense and isinstance(child, nn.Linear):
             wrapped = LoRADenseLinear(child, rank=rank, alpha=alpha)
@@ -326,6 +405,7 @@ def merge_lora_weights(model: nn.Module, inplace: bool = True) -> nn.Module:
     - LoRADenseLinear -> nn.Linear (with merged weights)
     - LoRAFCLayer -> e3nn _Layer (with merged weights)
     - LoRAO3Linear -> o3.Linear (with merged weights)
+    - LoRACuEquivarianceLinear -> cueq Linear (with merged weights)
 
     Args:
         model: Model containing LoRA layers to merge.
@@ -342,7 +422,10 @@ def merge_lora_weights(model: nn.Module, inplace: bool = True) -> nn.Module:
 
     def merge_recursive(module: nn.Module) -> None:
         for name, child in list(module.named_children()):
-            if isinstance(child, (LoRADenseLinear, LoRAFCLayer, LoRAO3Linear)):
+            if isinstance(
+                child,
+                (LoRADenseLinear, LoRAFCLayer, LoRAO3Linear, LoRACuEquivarianceLinear),
+            ):
                 setattr(module, name, child.merge_into_base())
             else:
                 merge_recursive(child)

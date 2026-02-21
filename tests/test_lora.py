@@ -11,7 +11,11 @@ from e3nn import o3
 from mace import data, modules, tools
 from mace.data import Configuration
 from mace.tools import torch_geometric
-from mace.modules.lora import inject_lora, merge_lora_weights
+from mace.modules.lora import (
+    LoRACuEquivarianceLinear,
+    inject_lora,
+    merge_lora_weights,
+)
 
 
 def _random_config() -> Configuration:
@@ -373,3 +377,44 @@ def test_lora_evaluate_preserves_frozen_state(build_lora_model, random_configs) 
         assert not lora_params_after[
             name
         ], f"Base param {name} should still be frozen after evaluate()"
+
+
+class FakeCueqLinear(torch.nn.Module):
+    __module__ = "cuequivariance_torch.operations.linear"
+
+    def __init__(self, in_dim: int = 5, out_dim: int = 4):
+        super().__init__()
+        self.irreps_in = o3.Irreps(f"{in_dim}x0e")
+        self.irreps_out = o3.Irreps(f"{out_dim}x0e")
+        self.weight = torch.nn.Parameter(torch.empty(out_dim, in_dim))
+        torch.nn.init.normal_(self.weight, mean=0.0, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self.weight.T
+
+
+class TinyCueqModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = FakeCueqLinear()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+
+def test_cueq_linear_is_wrapped_and_merged() -> None:
+    model = TinyCueqModel()
+    inject_lora(model, rank=2, alpha=1.0, wrap_equivariant=True, wrap_dense=False)
+    assert isinstance(model.linear, LoRACuEquivarianceLinear)
+
+    x = torch.randn(7, 5)
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if "lora_" in name:
+                torch.nn.init.normal_(param, mean=0.0, std=0.05)
+        y_before = model(x)
+
+    merge_lora_weights(model)
+    assert isinstance(model.linear, FakeCueqLinear)
+    y_after = model(x)
+    assert torch.allclose(y_before, y_after, rtol=1e-5, atol=1e-6)
