@@ -6,6 +6,16 @@ from e3nn import o3
 from e3nn.nn._fc import _Layer as E3NNFCLayer
 from torch import nn
 
+try:
+    import cuequivariance as cue
+    import cuequivariance_torch as cuet
+
+    CUET_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    CUET_AVAILABLE = False
+    cue = None  # type: ignore
+    cuet = None  # type: ignore
+
 
 def build_lora_irreps(
     irreps_in: o3.Irreps, irreps_out: o3.Irreps, rank: int
@@ -150,6 +160,169 @@ class LoRAO3Linear(nn.Module):
         return self.base
 
 
+def _cuet_irreps_to_o3(cuet_irreps) -> o3.Irreps:
+    """Convert cuequivariance Irreps to e3nn o3.Irreps.
+
+    The cue.Irreps stores irreps in a format like '16x0e + 16x1o'.
+    We extract the string representation which is compatible with o3.Irreps.
+    """
+    irreps_str = str(cuet_irreps)
+    parts = []
+    for segment in cuet_irreps:
+        mul = segment.mul
+        ir = segment.ir
+        l_val = ir.l
+        p_val = "e" if ir.p == 1 else "o"
+        parts.append(f"{mul}x{l_val}{p_val}")
+    return o3.Irreps(" + ".join(parts))
+
+
+class LoRACuetLinear(nn.Module):
+    """LoRA for cuequivariance cuet.Linear layers (preserves O(3) equivariance).
+
+    Uses activation-space computation during training for correct gradient flow.
+    The base layer uses optimized cueq CUDA kernels while LoRA adapters use
+    small o3.Linear layers.
+
+    Key design: the base cuet.Linear runs the main forward pass with optimized
+    kernels, while LoRA A/B are small equivariant layers that add a low-rank
+    correction. This maintains cueq's performance benefits while enabling
+    parameter-efficient finetuning.
+    """
+
+    def __init__(self, base_linear, rank: int = 4, alpha: float = 1.0):
+        super().__init__()
+        if not CUET_AVAILABLE:
+            raise RuntimeError("cuequivariance not available for LoRACuetLinear")
+
+        self.base = base_linear
+        self.scaling = float(alpha) / float(rank)
+
+        self.irreps_in = _cuet_irreps_to_o3(self.base.irreps_in)
+        self.irreps_out = _cuet_irreps_to_o3(self.base.irreps_out)
+        self.lora_irreps = build_lora_irreps(self.irreps_in, self.irreps_out, rank)
+
+        self.lora_A = o3.Linear(
+            self.irreps_in, self.lora_irreps, internal_weights=True, biases=False
+        )
+        self.lora_B = o3.Linear(
+            self.lora_irreps, self.irreps_out, internal_weights=True, biases=False
+        )
+
+        base_param = next(self.base.parameters())
+        self.lora_A.to(dtype=base_param.dtype, device=base_param.device)
+        self.lora_B.to(dtype=base_param.dtype, device=base_param.device)
+
+        self._cached_merged_weight: torch.Tensor | None = None
+
+        self._build_instruction_mapping()
+
+        with torch.no_grad():
+            for p in self.lora_B.parameters():
+                p.zero_()
+            for p in self.lora_A.parameters():
+                if p.dim() >= 2:
+                    p.normal_(mean=0.0, std=1e-3)
+
+    def _build_instruction_mapping(self) -> None:
+        """Build lookup tables for matching instructions between base, A, and B.
+
+        For cuet.Linear, we need to map between the o3.Linear LoRA instructions
+        and the cuet weight structure. Since cuet weights are stored in a flat
+        tensor compatible with o3, we can use the o3.Linear instruction structure.
+        """
+        self._A_by_i_in = {}
+        for idx, instr in enumerate(self.lora_A.instructions):
+            self._A_by_i_in[instr.i_in] = (idx, instr.i_out, instr.path_weight)
+
+        self._B_by_in_out = {}
+        for idx, instr in enumerate(self.lora_B.instructions):
+            self._B_by_in_out[(instr.i_in, instr.i_out)] = (idx, instr.path_weight)
+
+        self._build_base_instruction_mapping()
+
+    def _build_base_instruction_mapping(self) -> None:
+        """Build instruction mapping for the cuet.Linear base.
+
+        cuet.Linear stores weights in a flat tensor. We need to understand its
+        structure to merge LoRA weights. The cuet.Linear weight layout follows
+        the irreps structure similar to o3.Linear.
+        """
+        self._base_instructions = []
+        irreps_in = self.irreps_in
+        irreps_out = self.irreps_out
+
+        offset = 0
+        for i_out, (mul_out, ir_out) in enumerate(irreps_out):
+            for i_in, (mul_in, ir_in) in enumerate(irreps_in):
+                if ir_in == ir_out:
+                    size = mul_in * mul_out
+                    self._base_instructions.append(
+                        {
+                            "i_in": i_in,
+                            "i_out": i_out,
+                            "offset": offset,
+                            "size": size,
+                            "shape": (mul_in, mul_out),
+                        }
+                    )
+                    offset += size
+
+    @staticmethod
+    def _extract_weight_blocks(linear: o3.Linear) -> dict[int, torch.Tensor]:
+        """Extract weight blocks indexed by instruction."""
+        blocks = {}
+        offset = 0
+        for idx, instr in enumerate(linear.instructions):
+            size = instr.path_shape[0] * instr.path_shape[1]
+            block = linear.weight[offset : offset + size].reshape(instr.path_shape)
+            blocks[idx] = block
+            offset += size
+        return blocks
+
+    def compute_weight_delta(self) -> torch.Tensor:
+        """Compute the LoRA weight delta in the cuet.Linear weight space."""
+        A_blocks = self._extract_weight_blocks(self.lora_A)
+        B_blocks = self._extract_weight_blocks(self.lora_B)
+
+        base_weight = self.base.weight.data
+        delta = torch.zeros_like(base_weight)
+
+        for base_instr in self._base_instructions:
+            i_in_base = base_instr["i_in"]
+            i_out_base = base_instr["i_out"]
+            offset = base_instr["offset"]
+            shape = base_instr["shape"]
+
+            if i_in_base not in self._A_by_i_in:
+                continue
+
+            A_idx, i_mid, pw_A = self._A_by_i_in[i_in_base]
+            B_key = (i_mid, i_out_base)
+            if B_key not in self._B_by_in_out:
+                continue
+
+            B_idx, pw_B = self._B_by_in_out[B_key]
+
+            composed = A_blocks[A_idx] @ B_blocks[B_idx]
+            delta[offset : offset + base_instr["size"]] = (
+                pw_A * pw_B * composed.flatten()
+            )
+
+        return delta
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self._cached_merged_weight = None
+        return self.base(x) + self.scaling * self.lora_B(self.lora_A(x))
+
+    def merge_into_base(self):
+        """Permanently merge LoRA weights into base and return the base layer."""
+        with torch.no_grad():
+            delta = self.compute_weight_delta()
+            self.base.weight.data.add_(self.scaling * delta)
+        return self.base
+
+
 class LoRADenseLinear(nn.Module):
     """LoRA for torch.nn.Linear.
 
@@ -274,6 +447,13 @@ class LoRAFCLayer(nn.Module):
         return self.base
 
 
+def _is_cuet_linear(module) -> bool:
+    """Check if a module is a cuet.Linear (cuequivariance linear layer)."""
+    if not CUET_AVAILABLE:
+        return False
+    return isinstance(module, cuet.Linear)
+
+
 def inject_lora(
     module: nn.Module,
     rank: int = 4,
@@ -282,11 +462,31 @@ def inject_lora(
     wrap_dense: bool = True,
     _is_root: bool = True,
 ) -> None:
-    """Recursively replace eligible linears with LoRA-wrapped versions."""
+    """Recursively replace eligible linears with LoRA-wrapped versions.
+
+    Supports both e3nn (o3.Linear) and cuequivariance (cuet.Linear) backends.
+    When a cueq model is used, cuet.Linear layers are wrapped with LoRACuetLinear
+    which uses optimized CUDA kernels for the base layer while applying LoRA
+    corrections in activation space.
+    """
+    lora_wrapper_types = (LoRAO3Linear, LoRADenseLinear, LoRAFCLayer)
+    if CUET_AVAILABLE:
+        lora_wrapper_types = (*lora_wrapper_types, LoRACuetLinear)
+
     for child_name, child in list(module.named_children()):
         # Skip already wrapped
-        if isinstance(child, (LoRAO3Linear, LoRADenseLinear, LoRAFCLayer)):
+        if isinstance(child, lora_wrapper_types):
             continue
+
+        # cuequivariance cuet.Linear (must check before o3.Linear to avoid issues)
+        if wrap_equivariant and _is_cuet_linear(child):
+            try:
+                wrapped = LoRACuetLinear(child, rank=rank, alpha=alpha)
+            except ValueError:
+                continue
+            setattr(module, child_name, wrapped)
+            continue
+
         # Equivariant o3.Linear
         if wrap_equivariant and isinstance(child, o3.Linear):
             try:
@@ -294,16 +494,20 @@ def inject_lora(
             except ValueError:  # If no shared irreps, skip
                 continue
             setattr(module, child_name, wrapped)
+            continue
+
         # Dense nn.Linear
         if wrap_dense and isinstance(child, nn.Linear):
             wrapped = LoRADenseLinear(child, rank=rank, alpha=alpha)
             setattr(module, child_name, wrapped)
             continue
+
         # e3nn FullyConnectedNet internal layer
         if wrap_dense and isinstance(child, E3NNFCLayer):
             wrapped = LoRAFCLayer(child, rank=rank, alpha=alpha)
             setattr(module, child_name, wrapped)
             continue
+
         # Recurse
         inject_lora(child, rank, alpha, wrap_equivariant, wrap_dense, _is_root=False)
 
@@ -326,6 +530,7 @@ def merge_lora_weights(model: nn.Module, inplace: bool = True) -> nn.Module:
     - LoRADenseLinear -> nn.Linear (with merged weights)
     - LoRAFCLayer -> e3nn _Layer (with merged weights)
     - LoRAO3Linear -> o3.Linear (with merged weights)
+    - LoRACuetLinear -> cuet.Linear (with merged weights)
 
     Args:
         model: Model containing LoRA layers to merge.
@@ -340,9 +545,13 @@ def merge_lora_weights(model: nn.Module, inplace: bool = True) -> nn.Module:
 
         model = copy.deepcopy(model)
 
+    lora_types = (LoRADenseLinear, LoRAFCLayer, LoRAO3Linear)
+    if CUET_AVAILABLE:
+        lora_types = (*lora_types, LoRACuetLinear)
+
     def merge_recursive(module: nn.Module) -> None:
         for name, child in list(module.named_children()):
-            if isinstance(child, (LoRADenseLinear, LoRAFCLayer, LoRAO3Linear)):
+            if isinstance(child, lora_types):
                 setattr(module, name, child.merge_into_base())
             else:
                 merge_recursive(child)
