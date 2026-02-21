@@ -732,6 +732,42 @@ def run(args) -> None:
     model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
     model.to(device)
 
+    logging.info("===========OPTIMIZER INFORMATION===========")
+    logging.info(f"Using {args.optimizer.upper()} as parameter optimizer")
+    logging.info(f"Batch size: {args.batch_size}")
+    if args.ema:
+        logging.info(f"Using Exponential Moving Average with decay: {args.ema_decay}")
+    logging.info(
+        f"Number of gradient updates: {int(args.max_num_epochs*len(train_set)/args.batch_size)}"
+    )
+    logging.info(f"Learning rate: {args.lr}, weight decay: {args.weight_decay}")
+    logging.info(loss_fn)
+
+    # Validate configuration
+    if args.lora and args.only_cueq:
+        raise ValueError(
+            "LoRA with --only_cueq is not supported. "
+            "Use --enable_cueq without --only_cueq to train with LoRA and cueq acceleration. "
+            "The model will be converted to e3nn format with merged LoRA weights when saved."
+        )
+    
+    # Cueq and OEQ conversion (BEFORE LoRA injection)
+    if args.enable_cueq and args.enable_oeq:
+        logging.warning(
+            "Both CUEQ and OEQ are enabled, using CUEQ for training. "
+            "To use OEQ, disable CUEQ with --disable_cueq."
+        )
+        args.enable_oeq = False
+    if args.enable_cueq and not args.only_cueq:
+        logging.info("Converting model to CUEQ for accelerated training")
+        assert model.__class__.__name__ in ["MACE", "ScaleShiftMACE", "MACELES"]
+        model = run_e3nn_to_cueq(deepcopy(model), device=device)
+    if args.enable_oeq:
+        logging.info("Converting model to OEQ for accelerated training")
+        assert model.__class__.__name__ in ["MACE", "ScaleShiftMACE", "MACELES"]
+        model = run_e3nn_to_oeq(deepcopy(model), device=device)
+
+    # LoRA injection (AFTER backend conversion so we wrap the correct layer types)
     if args.lora:
         lora_rank = args.lora_rank
         lora_alpha = args.lora_alpha
@@ -753,33 +789,6 @@ def run(args) -> None:
             "Model with LoRA has %s trainable parameters.",
             tools.count_parameters(model),
         )
-
-    logging.info("===========OPTIMIZER INFORMATION===========")
-    logging.info(f"Using {args.optimizer.upper()} as parameter optimizer")
-    logging.info(f"Batch size: {args.batch_size}")
-    if args.ema:
-        logging.info(f"Using Exponential Moving Average with decay: {args.ema_decay}")
-    logging.info(
-        f"Number of gradient updates: {int(args.max_num_epochs*len(train_set)/args.batch_size)}"
-    )
-    logging.info(f"Learning rate: {args.lr}, weight decay: {args.weight_decay}")
-    logging.info(loss_fn)
-
-    # Cueq and OEQ conversion
-    if args.enable_cueq and args.enable_oeq:
-        logging.warning(
-            "Both CUEQ and OEQ are enabled, using CUEQ for training. "
-            "To use OEQ, disable CUEQ with --disable_cueq."
-        )
-        args.enable_oeq = False
-    if args.enable_cueq and not args.only_cueq:
-        logging.info("Converting model to CUEQ for accelerated training")
-        assert model.__class__.__name__ in ["MACE", "ScaleShiftMACE", "MACELES"]
-        model = run_e3nn_to_cueq(deepcopy(model), device=device)
-    if args.enable_oeq:
-        logging.info("Converting model to OEQ for accelerated training")
-        assert model.__class__.__name__ in ["MACE", "ScaleShiftMACE", "MACELES"]
-        model = run_e3nn_to_oeq(deepcopy(model), device=device)
 
     # Optimizer
     param_options = get_params_options(args, model)
@@ -1035,15 +1044,17 @@ def run(args) -> None:
                 model_path = Path(args.checkpoints_dir) / (tag + ".model")
             logging.info(f"Saving model to {model_path}")
             model_to_save = deepcopy(model)
+            # Convert back to e3nn BEFORE merging LoRA (LoRA merge requires e3nn backend)
+            if args.enable_cueq and not args.only_cueq:
+                logging.info("RUNING CUEQ TO E3NN")
+                model_to_save = run_cueq_to_e3nn(model_to_save, device=device)
+            if args.enable_oeq:
+                logging.info("RUNING OEQ TO E3NN")
+                model_to_save = run_oeq_to_e3nn(model_to_save, device=device)
+            # Now merge LoRA weights after conversion back to e3nn
             if args.lora:
                 logging.info("Merging LoRA weights into base model")
                 merge_lora_weights(model_to_save)
-            if args.enable_cueq and not args.only_cueq:
-                logging.info("RUNING CUEQ TO E3NN")
-                model_to_save = run_cueq_to_e3nn(deepcopy(model), device=device)
-            if args.enable_oeq:
-                logging.info("RUNING OEQ TO E3NN")
-                model_to_save = run_oeq_to_e3nn(deepcopy(model), device=device)
             if args.save_cpu:
                 model_to_save = model_to_save.to("cpu")
             torch.save(model_to_save, model_path)

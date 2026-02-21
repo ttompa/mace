@@ -13,6 +13,17 @@ from mace.data import Configuration
 from mace.tools import torch_geometric
 from mace.modules.lora import inject_lora, merge_lora_weights
 
+try:
+    from mace.cli.convert_e3nn_cueq import run as run_e3nn_to_cueq
+    from mace.cli.convert_cueq_e3nn import run as run_cueq_to_e3nn
+    import cuequivariance_torch as cuet
+    CUET_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    CUET_AVAILABLE = False
+    run_e3nn_to_cueq = None
+    run_cueq_to_e3nn = None
+    cuet = None
+
 
 def _random_config() -> Configuration:
     atomic_numbers = np.array([6, 1, 1], dtype=int)
@@ -373,3 +384,260 @@ def test_lora_evaluate_preserves_frozen_state(build_lora_model, random_configs) 
         assert not lora_params_after[
             name
         ], f"Base param {name} should still be frozen after evaluate()"
+
+
+@pytest.mark.skipif(not CUET_AVAILABLE, reason="cuequivariance not installed")
+def test_lora_with_cueq_conversion() -> None:
+    """Test that LoRA works correctly with cueq conversion."""
+    from mace.modules.lora import LoRAO3Linear
+    
+    # Build e3nn model
+    model, table = _build_model()
+    
+    # Inject LoRA on e3nn model
+    inject_lora(model, rank=2, alpha=0.5)
+    _randomize_lora_parameters(model)
+    
+    # Verify LoRA was injected (should have LoRAO3Linear wrapping o3.Linear)
+    lora_count_e3nn = sum(
+        1 for m in model.modules() if isinstance(m, LoRAO3Linear)
+    )
+    assert lora_count_e3nn > 0, "Should have LoRA wrappers in e3nn model"
+    
+    # Get outputs from e3nn + LoRA
+    config = _random_config()
+    model.eval()
+    with torch.no_grad():
+        energy_e3nn, forces_e3nn = _forward_energy_forces(model, [config], table)
+    
+    # Convert to cueq (should preserve LoRA)
+    model_cueq = run_e3nn_to_cueq(model, device="cpu", return_model=True)
+    
+    # Verify LoRA was preserved
+    lora_count_cueq = sum(
+        1 for m in model_cueq.modules() if isinstance(m, LoRAO3Linear)
+    )
+    assert lora_count_cueq == lora_count_e3nn, "LoRA should be preserved after cueq conversion"
+    
+    # Verify some LoRA wrappers now wrap cuet.Linear
+    has_cuet_base = any(
+        isinstance(m.base, cuet.Linear)
+        for m in model_cueq.modules()
+        if isinstance(m, LoRAO3Linear)
+    )
+    assert has_cuet_base, "Some LoRA wrappers should wrap cuet.Linear after conversion"
+    
+    # Get outputs from cueq + LoRA (should match e3nn + LoRA)
+    model_cueq.eval()
+    with torch.no_grad():
+        energy_cueq, forces_cueq = _forward_energy_forces(model_cueq, [config], table)
+    
+    assert torch.allclose(energy_e3nn, energy_cueq, rtol=1e-5, atol=1e-6), \
+        f"Energy mismatch after cueq conversion: {energy_e3nn} vs {energy_cueq}"
+    assert torch.allclose(forces_e3nn, forces_cueq, rtol=1e-5, atol=1e-6), \
+        f"Forces mismatch after cueq conversion"
+    
+    # Convert back to e3nn (should preserve LoRA)
+    model_e3nn_back = run_cueq_to_e3nn(model_cueq, device="cpu", return_model=True)
+    
+    # Verify LoRA was preserved
+    lora_count_back = sum(
+        1 for m in model_e3nn_back.modules() if isinstance(m, LoRAO3Linear)
+    )
+    assert lora_count_back == lora_count_cueq, "LoRA should be preserved after e3nn conversion"
+    
+    # Get outputs after round-trip conversion
+    model_e3nn_back.eval()
+    with torch.no_grad():
+        energy_back, forces_back = _forward_energy_forces(model_e3nn_back, [config], table)
+    
+    assert torch.allclose(energy_e3nn, energy_back, rtol=1e-5, atol=1e-6), \
+        "Energy should match after round-trip conversion"
+    assert torch.allclose(forces_e3nn, forces_back, rtol=1e-5, atol=1e-6), \
+        "Forces should match after round-trip conversion"
+    
+    # Now test merging after conversion back to e3nn
+    merge_lora_weights(model_e3nn_back)
+    
+    # Verify merge removed wrappers
+    lora_count_merged = sum(
+        1 for m in model_e3nn_back.modules() if isinstance(m, LoRAO3Linear)
+    )
+    assert lora_count_merged == 0, "LoRA wrappers should be removed after merge"
+    
+    # Verify outputs still match
+    model_e3nn_back.eval()
+    with torch.no_grad():
+        energy_merged, forces_merged = _forward_energy_forces(model_e3nn_back, [config], table)
+    
+    assert torch.allclose(energy_e3nn, energy_merged, rtol=1e-5, atol=1e-6), \
+        "Energy should match after merge"
+    assert torch.allclose(forces_e3nn, forces_merged, rtol=1e-5, atol=1e-6), \
+        "Forces should match after merge"
+
+
+@pytest.mark.skipif(not CUET_AVAILABLE, reason="cuequivariance not installed")
+def test_lora_inject_on_cueq_model() -> None:
+    """Test that LoRA can be injected directly on a cueq model."""
+    from mace.modules.lora import LoRAO3Linear
+    from mace.modules.wrapper_ops import CuEquivarianceConfig
+    
+    # Build cueq model directly
+    table = tools.AtomicNumberTable([1, 6])
+    cueq_config = CuEquivarianceConfig(
+        enabled=True,
+        layout="ir_mul",
+        group="O3_e3nn",
+        optimize_all=True,
+        conv_fusion=False,
+    )
+    model = modules.MACE(
+        r_max=4.5,
+        num_bessel=4,
+        num_polynomial_cutoff=3,
+        max_ell=1,
+        interaction_cls=modules.interaction_classes[
+            "RealAgnosticResidualInteractionBlock"
+        ],
+        interaction_cls_first=modules.interaction_classes[
+            "RealAgnosticResidualInteractionBlock"
+        ],
+        num_interactions=2,
+        num_elements=2,
+        hidden_irreps=o3.Irreps("16x0e + 16x1o"),
+        MLP_irreps=o3.Irreps("16x0e"),
+        gate=torch.nn.functional.silu,
+        atomic_energies=np.random.normal(scale=0.1, size=len(table.zs)),
+        avg_num_neighbors=6.0,
+        atomic_numbers=table.zs,
+        correlation=2,
+        radial_type="bessel",
+        cueq_config=cueq_config,
+    )
+    
+    # Inject LoRA on cueq model
+    inject_lora(model, rank=2, alpha=0.5)
+    
+    # Verify LoRA was injected
+    lora_wrappers = [m for m in model.modules() if isinstance(m, LoRAO3Linear)]
+    assert len(lora_wrappers) > 0, "Should have LoRA wrappers"
+    
+    # Verify some wrappers wrap cuet.Linear
+    cuet_bases = [w for w in lora_wrappers if isinstance(w.base, cuet.Linear)]
+    assert len(cuet_bases) > 0, "Some LoRA wrappers should wrap cuet.Linear"
+    
+    # Verify LoRA A and B are also cuet.Linear
+    for wrapper in cuet_bases:
+        assert isinstance(wrapper.lora_A, cuet.Linear), "lora_A should be cuet.Linear"
+        assert isinstance(wrapper.lora_B, cuet.Linear), "lora_B should be cuet.Linear"
+        assert wrapper.is_cueq, "Should detect cueq backend"
+    
+    # Test forward pass
+    config = _random_config()
+    model.eval()
+    with torch.no_grad():
+        energy, forces = _forward_energy_forces(model, [config], table)
+    
+    assert energy.shape == (1,), "Should produce energy output"
+    assert forces.shape == (1, 3, 3), "Should produce forces output"
+    
+    # Test training mode
+    model.train()
+    energy_train, forces_train = _forward_energy_forces(model, [config], table)
+    assert energy_train.requires_grad, "Should have gradients in train mode"
+
+
+@pytest.mark.skipif(not CUET_AVAILABLE, reason="cuequivariance not installed")
+def test_lora_cueq_gradient_flow() -> None:
+    """Test that gradients flow correctly through LoRA + cueq."""
+    from mace.modules.lora import LoRAO3Linear
+    from mace.modules.wrapper_ops import CuEquivarianceConfig
+    
+    # Build cueq model
+    table = tools.AtomicNumberTable([1, 6])
+    cueq_config = CuEquivarianceConfig(
+        enabled=True,
+        layout="ir_mul",
+        group="O3_e3nn",
+        optimize_all=True,
+        conv_fusion=False,
+    )
+    model = modules.MACE(
+        r_max=4.5,
+        num_bessel=4,
+        num_polynomial_cutoff=3,
+        max_ell=1,
+        interaction_cls=modules.interaction_classes[
+            "RealAgnosticResidualInteractionBlock"
+        ],
+        interaction_cls_first=modules.interaction_classes[
+            "RealAgnosticResidualInteractionBlock"
+        ],
+        num_interactions=2,
+        num_elements=2,
+        hidden_irreps=o3.Irreps("16x0e + 16x1o"),
+        MLP_irreps=o3.Irreps("16x0e"),
+        gate=torch.nn.functional.silu,
+        atomic_energies=np.random.normal(scale=0.1, size=len(table.zs)),
+        avg_num_neighbors=6.0,
+        atomic_numbers=table.zs,
+        correlation=2,
+        radial_type="bessel",
+        cueq_config=cueq_config,
+    )
+    
+    # Inject LoRA
+    inject_lora(model, rank=2, alpha=0.5)
+    _randomize_lora_parameters(model)
+    
+    # Verify we have cuet-based LoRA
+    lora_wrappers = [m for m in model.modules() if isinstance(m, LoRAO3Linear)]
+    cuet_wrappers = [w for w in lora_wrappers if w.is_cueq]
+    assert len(cuet_wrappers) > 0, "Should have cueq-based LoRA wrappers"
+    
+    # Test gradient flow
+    model.train()
+    config = _random_config()
+    dataset = [_atomic_data_from_config(config, table)]
+    loader = torch_geometric.dataloader.DataLoader(
+        dataset=dataset,
+        batch_size=1,
+        shuffle=False,
+        drop_last=False,
+    )
+    batch = next(iter(loader))
+    
+    # Forward pass
+    outputs = model(batch.to_dict())
+    energy = outputs["energy"]
+    forces = outputs["forces"]
+    
+    # Compute loss
+    loss = energy.sum() + forces.abs().sum()
+    
+    # Backward pass
+    loss.backward()
+    
+    # Check that LoRA parameters have gradients
+    lora_params_with_grad = []
+    lora_params_without_grad = []
+    base_params_with_grad = []
+    
+    for name, param in model.named_parameters():
+        if "lora_A" in name or "lora_B" in name:
+            if param.grad is not None and param.grad.abs().sum() > 0:
+                lora_params_with_grad.append(name)
+            else:
+                lora_params_without_grad.append(name)
+        elif ".base." in name:
+            if param.grad is not None and param.grad.abs().sum() > 0:
+                base_params_with_grad.append(name)
+    
+    # LoRA parameters should have gradients
+    assert len(lora_params_with_grad) > 0, "LoRA parameters should have gradients"
+    assert len(lora_params_without_grad) == 0, \
+        f"All LoRA parameters should have gradients, but these don't: {lora_params_without_grad}"
+    
+    # Base parameters should NOT have gradients (frozen)
+    assert len(base_params_with_grad) == 0, \
+        f"Base parameters should be frozen, but these have gradients: {base_params_with_grad}"

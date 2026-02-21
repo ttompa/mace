@@ -6,6 +6,26 @@ from e3nn import o3
 from e3nn.nn._fc import _Layer as E3NNFCLayer
 from torch import nn
 
+try:
+    import cuequivariance as cue
+    import cuequivariance_torch as cuet
+
+    CUET_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    CUET_AVAILABLE = False
+    cuet = None
+    cue = None
+
+
+def _cue_irreps_to_o3(cue_irreps) -> o3.Irreps:
+    """Convert cue.Irreps to o3.Irreps"""
+    return o3.Irreps(str(cue_irreps))
+
+
+def _o3_irreps_to_cue(o3_irreps: o3.Irreps, group, layout):
+    """Convert o3.Irreps to cue.Irreps"""
+    return cue.Irreps(group, o3_irreps)
+
 
 def build_lora_irreps(
     irreps_in: o3.Irreps, irreps_out: o3.Irreps, rank: int
@@ -28,37 +48,74 @@ def build_lora_irreps(
 class LoRAO3Linear(nn.Module):
     """LoRA for equivariant o3.Linear-like layers (preserves O(3) equivariance).
 
-    Uses fused weight computation: W_merged = W_base + scaling * (W_A @ W_B)
-    with automatic caching during inference (when grad is disabled).
+    Supports both e3nn o3.Linear and cuequivariance cuet.Linear backends.
+    Uses fused weight computation for o3.Linear in inference mode.
+    For cuet.Linear, uses activation-space computation for robustness.
     """
 
-    def __init__(self, base_linear: o3.Linear, rank: int = 4, alpha: float = 1.0):
+    def __init__(self, base_linear, rank: int = 4, alpha: float = 1.0):
         super().__init__()
         self.base = base_linear
-        self.irreps_in = self.base.irreps_in
-        self.irreps_out = self.base.irreps_out
         self.scaling = float(alpha) / float(rank)
+        
+        # Detect backend type
+        self.is_cueq = CUET_AVAILABLE and cuet is not None and isinstance(self.base, cuet.Linear)
+        self.is_e3nn = isinstance(self.base, o3.Linear)
+        
+        if not (self.is_cueq or self.is_e3nn):
+            raise TypeError(f"Base layer must be o3.Linear or cuet.Linear, got {type(self.base)}")
+        
+        # Extract irreps (convert from cue.Irreps to o3.Irreps if needed)
+        if self.is_cueq:
+            self.irreps_in = _cue_irreps_to_o3(self.base.irreps_in)
+            self.irreps_out = _cue_irreps_to_o3(self.base.irreps_out)
+            # Store cueq config for creating lora_A and lora_B
+            self._cueq_group = self.base.irreps_in.group
+            self._cueq_layout = self.base.layout
+        else:
+            self.irreps_in = self.base.irreps_in
+            self.irreps_out = self.base.irreps_out
+        
+        # Build LoRA bottleneck irreps
         self.lora_irreps = build_lora_irreps(self.irreps_in, self.irreps_out, rank)
 
-        # Use the same class as base to avoid layout mismatches if possible
-        layer_type = type(self.base)
-        self.lora_A = layer_type(
-            self.irreps_in, self.lora_irreps, internal_weights=True, biases=False
-        )
-        self.lora_B = layer_type(
-            self.lora_irreps, self.irreps_out, internal_weights=True, biases=False
-        )
+        # Create LoRA layers using the same backend as base
+        if self.is_cueq:
+            # Create cuet.Linear layers for LoRA
+            self.lora_A = cuet.Linear(
+                _o3_irreps_to_cue(self.irreps_in, self._cueq_group, self._cueq_layout),
+                _o3_irreps_to_cue(self.lora_irreps, self._cueq_group, self._cueq_layout),
+                layout=self._cueq_layout,
+                shared_weights=True,
+                method="naive",
+            )
+            self.lora_B = cuet.Linear(
+                _o3_irreps_to_cue(self.lora_irreps, self._cueq_group, self._cueq_layout),
+                _o3_irreps_to_cue(self.irreps_out, self._cueq_group, self._cueq_layout),
+                layout=self._cueq_layout,
+                shared_weights=True,
+                method="naive",
+            )
+        else:
+            # Create o3.Linear layers for LoRA
+            self.lora_A = o3.Linear(
+                self.irreps_in, self.lora_irreps, internal_weights=True, biases=False
+            )
+            self.lora_B = o3.Linear(
+                self.lora_irreps, self.irreps_out, internal_weights=True, biases=False
+            )
 
         # Match dtype/device to base
         base_param = next(self.base.parameters())
         self.lora_A.to(dtype=base_param.dtype, device=base_param.device)
         self.lora_B.to(dtype=base_param.dtype, device=base_param.device)
 
-        # Cache for merged weight (used during inference)
+        # Cache for merged weight (only used for o3.Linear in inference)
         self._cached_merged_weight: torch.Tensor | None = None
 
-        # Build instruction mapping for weight composition
-        self._build_instruction_mapping()
+        # Build instruction mapping for weight composition (only for o3.Linear)
+        if self.is_e3nn:
+            self._build_instruction_mapping()
 
         with torch.no_grad():
             for p in self.lora_B.parameters():
@@ -127,12 +184,17 @@ class LoRAO3Linear(nn.Module):
         return torch.cat([b.flatten() for b in merged_blocks])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Training mode: always use activation-space computation for correct gradients
         if torch.is_grad_enabled():
-            # Training: use activation-space computation for correct gradient flow
             self._cached_merged_weight = None
             return self.base(x) + self.scaling * self.lora_B(self.lora_A(x))
 
-        # Inference: use fused weight-space computation with caching
+        # Inference mode: use weight merging for o3.Linear, activation-space for cuet.Linear
+        if self.is_cueq:
+            # For cuet.Linear, use activation-space computation (weight merging is complex)
+            return self.base(x) + self.scaling * self.lora_B(self.lora_A(x))
+        
+        # For o3.Linear, use fused weight-space computation with caching
         if self._cached_merged_weight is None:
             self._cached_merged_weight = self.compute_merged_weight()
 
@@ -143,8 +205,16 @@ class LoRAO3Linear(nn.Module):
         finally:
             self.base.weight.data = original_weight
 
-    def merge_into_base(self) -> o3.Linear:
-        """Permanently merge LoRA weights into base and return the base layer."""
+    def merge_into_base(self):
+        """Permanently merge LoRA weights into base and return the base layer.
+        
+        Note: For cuet.Linear, this should only be called after converting back to e3nn.
+        """
+        if self.is_cueq:
+            raise RuntimeError(
+                "Cannot merge LoRA weights for cuet.Linear. "
+                "Convert model back to e3nn first using convert_cueq_e3nn."
+            )
         with torch.no_grad():
             self.base.weight.copy_(self.compute_merged_weight())
         return self.base
@@ -282,28 +352,39 @@ def inject_lora(
     wrap_dense: bool = True,
     _is_root: bool = True,
 ) -> None:
-    """Recursively replace eligible linears with LoRA-wrapped versions."""
+    """Recursively replace eligible linears with LoRA-wrapped versions.
+    
+    Supports both e3nn o3.Linear and cuequivariance cuet.Linear backends.
+    """
     for child_name, child in list(module.named_children()):
         # Skip already wrapped
         if isinstance(child, (LoRAO3Linear, LoRADenseLinear, LoRAFCLayer)):
             continue
-        # Equivariant o3.Linear
-        if wrap_equivariant and isinstance(child, o3.Linear):
+        
+        # Equivariant linears (o3.Linear or cuet.Linear)
+        is_o3_linear = isinstance(child, o3.Linear)
+        is_cuet_linear = CUET_AVAILABLE and cuet is not None and isinstance(child, cuet.Linear)
+        
+        if wrap_equivariant and (is_o3_linear or is_cuet_linear):
             try:
                 wrapped = LoRAO3Linear(child, rank=rank, alpha=alpha)
             except ValueError:  # If no shared irreps, skip
                 continue
             setattr(module, child_name, wrapped)
+            continue
+        
         # Dense nn.Linear
         if wrap_dense and isinstance(child, nn.Linear):
             wrapped = LoRADenseLinear(child, rank=rank, alpha=alpha)
             setattr(module, child_name, wrapped)
             continue
+        
         # e3nn FullyConnectedNet internal layer
         if wrap_dense and isinstance(child, E3NNFCLayer):
             wrapped = LoRAFCLayer(child, rank=rank, alpha=alpha)
             setattr(module, child_name, wrapped)
             continue
+        
         # Recurse
         inject_lora(child, rank, alpha, wrap_equivariant, wrap_dense, _is_root=False)
 

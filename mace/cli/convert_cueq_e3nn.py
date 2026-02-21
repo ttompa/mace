@@ -1,12 +1,13 @@
 import argparse
 import logging
 import os
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 from e3nn import o3
 
+from mace.modules.lora import inject_LoRAs
 from mace.tools.cg import O3_e3nn
 from mace.tools.cg_cueq_tools import symmetric_contraction_proj
 from mace.tools.scripts_utils import extract_config_mace_model
@@ -125,6 +126,33 @@ def transfer_symmetric_contractions(
                 idx += 1
 
 
+def detect_lora_config(model: torch.nn.Module) -> Optional[Tuple[bool, int, float]]:
+    """Detect if model has LoRA and extract rank/alpha.
+    
+    Returns: (has_lora, rank, alpha) or None
+    """
+    from mace.modules.lora import LoRAO3Linear, LoRADenseLinear, LoRAFCLayer
+    
+    for module in model.modules():
+        if isinstance(module, (LoRAO3Linear, LoRADenseLinear, LoRAFCLayer)):
+            if isinstance(module, LoRAO3Linear):
+                # Extract rank from lora_irreps
+                rank = len(module.lora_irreps) // len(
+                    set(ir for _, ir in module.lora_irreps)
+                )
+                alpha = module.scaling * rank
+                return (True, rank, alpha)
+            elif isinstance(module, LoRADenseLinear):
+                rank = module.lora_A.out_features
+                alpha = module.scaling * rank
+                return (True, rank, alpha)
+            elif isinstance(module, LoRAFCLayer):
+                rank = module.lora_A.shape[1]
+                alpha = module.scaling * rank
+                return (True, rank, alpha)
+    return None
+
+
 def transfer_weights(
     source_model: torch.nn.Module,
     target_model: torch.nn.Module,
@@ -195,6 +223,17 @@ def run(input_model, output_model="_e3nn.model", device="cpu", return_model=True
         source_model = input_model
     default_dtype = next(source_model.parameters()).dtype
     torch.set_default_dtype(default_dtype)
+    
+    # Check if source has LoRA
+    lora_config = detect_lora_config(source_model)
+    has_lora = lora_config is not None
+    
+    if has_lora:
+        _, lora_rank, lora_alpha = lora_config
+        logging.info(
+            f"Detected LoRA in source model (rank={lora_rank}, alpha={lora_alpha})"
+        )
+    
     # Extract configuration
     config = extract_config_mace_model(source_model)
 
@@ -209,6 +248,11 @@ def run(input_model, output_model="_e3nn.model", device="cpu", return_model=True
     # Create new model without CuEq config
     logging.info("Creating new model without CuEq settings")
     target_model = source_model.__class__(**config)
+    
+    # If source has LoRA, inject LoRA on target before weight transfer
+    if has_lora:
+        logging.info(f"Injecting LoRA on target model (rank={lora_rank}, alpha={lora_alpha})")
+        inject_LoRAs(target_model, rank=lora_rank, alpha=lora_alpha)
 
     # Transfer weights with proper remapping
     num_layers = config["num_interactions"]
