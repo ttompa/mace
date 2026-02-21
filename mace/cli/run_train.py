@@ -775,7 +775,22 @@ def run(args) -> None:
     if args.enable_cueq and not args.only_cueq:
         logging.info("Converting model to CUEQ for accelerated training")
         assert model.__class__.__name__ in ["MACE", "ScaleShiftMACE", "MACELES"]
+        if args.lora:
+            # LoRA wrappers sit around o3.Linear modules in the e3nn model.
+            # The cueq conversion creates a brand-new model from config and
+            # transfers weights by state-dict key — it cannot preserve the
+            # LoRA wrapper structure.  We therefore merge the LoRA delta into
+            # the base weights first so the pretrained + adapted weights are
+            # correctly carried over, then re-inject LoRA into the resulting
+            # cueq model (which has cuet.Linear layers instead of o3.Linear).
+            logging.info(
+                "Merging LoRA weights into base before CUEQ conversion, "
+                "then re-injecting LoRA into CUEQ model"
+            )
+            merge_lora_weights(model)
         model = run_e3nn_to_cueq(deepcopy(model), device=device)
+        if args.lora:
+            model = inject_LoRAs(model, rank=args.lora_rank, alpha=args.lora_alpha)
     if args.enable_oeq:
         logging.info("Converting model to OEQ for accelerated training")
         assert model.__class__.__name__ in ["MACE", "ScaleShiftMACE", "MACELES"]
@@ -1039,8 +1054,10 @@ def run(args) -> None:
                 logging.info("Merging LoRA weights into base model")
                 merge_lora_weights(model_to_save)
             if args.enable_cueq and not args.only_cueq:
-                logging.info("RUNING CUEQ TO E3NN")
-                model_to_save = run_cueq_to_e3nn(deepcopy(model), device=device)
+                logging.info("Converting CUEQ model to E3NN for saving")
+                # Use model_to_save (with LoRA already merged) as the source,
+                # not a fresh deepcopy of the training model.
+                model_to_save = run_cueq_to_e3nn(model_to_save, device=device)
             if args.enable_oeq:
                 logging.info("RUNING OEQ TO E3NN")
                 model_to_save = run_oeq_to_e3nn(deepcopy(model), device=device)
