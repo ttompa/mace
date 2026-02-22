@@ -6,6 +6,14 @@ from e3nn import o3
 from e3nn.nn._fc import _Layer as E3NNFCLayer
 from torch import nn
 
+try:
+    import cuequivariance as cue
+    import cuequivariance_torch as cuet
+
+    CUET_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    CUET_AVAILABLE = False
+
 
 def build_lora_irreps(
     irreps_in: o3.Irreps, irreps_out: o3.Irreps, rank: int
@@ -150,6 +158,219 @@ class LoRAO3Linear(nn.Module):
         return self.base
 
 
+class LoRACuETLinear(nn.Module):
+    """LoRA for cuet.Linear (cuequivariance-accelerated equivariant linear layers).
+
+    Keeps the cuet.Linear as the base for fast GPU kernels, and adds small
+    o3.Linear LoRA branches that operate in activation space.
+
+    The data layout must be converted between ir_mul (cueq) and mul_ir (e3nn)
+    for the LoRA branches. This is done via simple reshape+transpose on the
+    irrep dimension blocks — the overhead is negligible for the small LoRA rank.
+
+    Forward: base(x) + scaling * lora_B(lora_A(transpose(x)))
+    where transpose converts between ir_mul and mul_ir layouts.
+    """
+
+    def __init__(self, base_linear: nn.Module, rank: int = 4, alpha: float = 1.0):
+        super().__init__()
+        if not CUET_AVAILABLE:
+            raise RuntimeError("cuequivariance_torch is required for LoRACuETLinear")
+
+        self.base = base_linear
+        self.scaling = float(alpha) / float(rank)
+
+        cue_irreps_in = self.base.irreps_in
+        cue_irreps_out = self.base.irreps_out
+        self.e3nn_irreps_in = o3.Irreps(str(cue_irreps_in.remove_group()))
+        self.e3nn_irreps_out = o3.Irreps(str(cue_irreps_out.remove_group()))
+
+        self.lora_irreps = build_lora_irreps(
+            self.e3nn_irreps_in, self.e3nn_irreps_out, rank
+        )
+
+        self.lora_A = o3.Linear(
+            self.e3nn_irreps_in, self.lora_irreps,
+            internal_weights=True, biases=False,
+        )
+        self.lora_B = o3.Linear(
+            self.lora_irreps, self.e3nn_irreps_out,
+            internal_weights=True, biases=False,
+        )
+
+        base_param = next(self.base.parameters())
+        self.lora_A.to(dtype=base_param.dtype, device=base_param.device)
+        self.lora_B.to(dtype=base_param.dtype, device=base_param.device)
+
+        self._layout_in = getattr(self.base, "layout_in", None)
+        self._needs_transpose = (
+            self._layout_in is not None
+            and str(self._layout_in) != "mul_ir"
+        )
+        if self._needs_transpose:
+            self._build_transpose_info()
+        else:
+            self.register_buffer("_perm_in_to_mul_ir", None)
+            self.register_buffer("_perm_out_to_ir_mul", None)
+
+        with torch.no_grad():
+            for p in self.lora_B.parameters():
+                p.zero_()
+            for p in self.lora_A.parameters():
+                if p.dim() >= 2:
+                    p.normal_(mean=0.0, std=1e-3)
+
+    def _build_transpose_info(self) -> None:
+        """Build index permutations for ir_mul <-> mul_ir layout conversion."""
+        self.register_buffer(
+            "_perm_in_to_mul_ir",
+            _ir_mul_to_mul_ir_perm(self.e3nn_irreps_in),
+        )
+        self.register_buffer(
+            "_perm_out_to_ir_mul",
+            _mul_ir_to_ir_mul_perm(self.e3nn_irreps_out),
+        )
+
+    def _to_mul_ir(self, x: torch.Tensor, irreps: o3.Irreps) -> torch.Tensor:
+        if not self._needs_transpose:
+            return x
+        return x[..., self._perm_in_to_mul_ir]
+
+    def _to_ir_mul(self, x: torch.Tensor, irreps: o3.Irreps) -> torch.Tensor:
+        if not self._needs_transpose:
+            return x
+        return x[..., self._perm_out_to_ir_mul]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_out = self.base(x)
+        x_mul_ir = self._to_mul_ir(x, self.e3nn_irreps_in)
+        lora_out_mul_ir = self.lora_B(self.lora_A(x_mul_ir))
+        lora_out = self._to_ir_mul(lora_out_mul_ir, self.e3nn_irreps_out)
+        return base_out + self.scaling * lora_out
+
+    def merge_into_base(self) -> nn.Module:
+        """Merge LoRA weights into the cuet.Linear base and return it.
+
+        Computes the LoRA weight delta using the o3.Linear LoRA branches,
+        then adds it to the cuet.Linear flat weight vector. Both o3.Linear
+        and cuet.Linear use the same flat weight format for shared-weight
+        equivariant linear maps.
+        """
+        with torch.no_grad():
+            A_blocks = LoRAO3Linear._extract_weight_blocks(self.lora_A)
+            B_blocks = LoRAO3Linear._extract_weight_blocks(self.lora_B)
+
+            A_by_i_in = {}
+            for idx, instr in enumerate(self.lora_A.instructions):
+                A_by_i_in[instr.i_in] = (idx, instr.i_out, instr.path_weight)
+
+            B_by_in_out = {}
+            for idx, instr in enumerate(self.lora_B.instructions):
+                B_by_in_out[(instr.i_in, instr.i_out)] = (idx, instr.path_weight)
+
+            # Use a temporary o3.Linear to get the instruction structure for
+            # the base weight, since cuet.Linear doesn't expose instructions
+            tmp_ref = o3.Linear(
+                self.e3nn_irreps_in, self.e3nn_irreps_out,
+                internal_weights=True,
+            )
+            tmp_ref.to(
+                dtype=self.base.weight.dtype, device=self.base.weight.device
+            )
+
+            base_weight_flat = self.base.weight.data.reshape(-1)
+            ref_blocks = {}
+            offset = 0
+            for idx, instr in enumerate(tmp_ref.instructions):
+                size = instr.path_shape[0] * instr.path_shape[1]
+                ref_blocks[idx] = base_weight_flat[offset : offset + size].reshape(
+                    instr.path_shape
+                )
+                offset += size
+
+            delta_parts = []
+            for base_idx, base_instr in enumerate(tmp_ref.instructions):
+                i_in_base = base_instr.i_in
+                i_out_base = base_instr.i_out
+                pw_base = base_instr.path_weight
+                block = ref_blocks[base_idx]
+
+                if i_in_base not in A_by_i_in:
+                    delta_parts.append(torch.zeros_like(block.flatten()))
+                    continue
+
+                A_idx, i_mid, pw_A = A_by_i_in[i_in_base]
+                B_key = (i_mid, i_out_base)
+                if B_key not in B_by_in_out:
+                    delta_parts.append(torch.zeros_like(block.flatten()))
+                    continue
+
+                B_idx, pw_B = B_by_in_out[B_key]
+                ratio = (pw_A * pw_B) / pw_base
+                delta = A_blocks[A_idx] @ B_blocks[B_idx]
+                delta_parts.append((self.scaling * ratio * delta).flatten())
+
+            delta_flat = torch.cat(delta_parts)
+            self.base.weight.data.reshape(-1).add_(delta_flat)
+
+        return self.base
+
+
+def _ir_mul_to_mul_ir_perm(irreps: o3.Irreps) -> torch.Tensor:
+    """Build permutation indices to convert ir_mul layout to mul_ir layout."""
+    perm = []
+    dim = sum(mul * ir.dim for mul, ir in irreps)
+    offset = 0
+    mul_offsets = []
+    for mul, ir in irreps:
+        mul_offsets.append((offset, mul, ir.dim))
+        offset += mul * ir.dim
+
+    # ir_mul: for each multiplicity, all irreps in sequence
+    # mul_ir: for each irrep, all multiplicities in sequence
+    # ir_mul index: m * sum(ir_dims) + ir_offset
+    # mul_ir index: ir_block_start + m * ir_dim + ir_component
+
+    # Actually for a single MulIr block (mul, ir):
+    # mul_ir layout: [m0_c0, m0_c1, ..., m1_c0, m1_c1, ...]  (mul groups of ir.dim)
+    # ir_mul layout: [m0_c0, m1_c0, ..., m0_c1, m1_c1, ...]  (ir.dim groups of mul)
+
+    # Within each (mul, ir) block, ir_mul[i] = mul_ir[perm[i]]
+    # ir_mul index (c, m) -> flat = c * mul + m
+    # mul_ir index (m, c) -> flat = m * ir.dim + c
+    # So perm_ir_mul_to_mul_ir[c * mul + m] = m * ir.dim + c
+
+    for block_offset, mul, ir_dim in mul_offsets:
+        for c in range(ir_dim):
+            for m in range(mul):
+                ir_mul_idx = block_offset + c * mul + m
+                mul_ir_idx = block_offset + m * ir_dim + c
+                perm.append((ir_mul_idx, mul_ir_idx))
+
+    perm.sort(key=lambda x: x[0])
+    return torch.tensor([p[1] for p in perm], dtype=torch.long)
+
+
+def _mul_ir_to_ir_mul_perm(irreps: o3.Irreps) -> torch.Tensor:
+    """Build permutation indices to convert mul_ir layout to ir_mul layout."""
+    perm = []
+    offset = 0
+    mul_offsets = []
+    for mul, ir in irreps:
+        mul_offsets.append((offset, mul, ir.dim))
+        offset += mul * ir.dim
+
+    for block_offset, mul, ir_dim in mul_offsets:
+        for m in range(mul):
+            for c in range(ir_dim):
+                mul_ir_idx = block_offset + m * ir_dim + c
+                ir_mul_idx = block_offset + c * mul + m
+                perm.append((mul_ir_idx, ir_mul_idx))
+
+    perm.sort(key=lambda x: x[0])
+    return torch.tensor([p[1] for p in perm], dtype=torch.long)
+
+
 class LoRADenseLinear(nn.Module):
     """LoRA for torch.nn.Linear.
 
@@ -274,6 +495,11 @@ class LoRAFCLayer(nn.Module):
         return self.base
 
 
+def _is_cuet_linear(module: nn.Module) -> bool:
+    """Check if a module is a cuet.Linear without requiring cuet to be installed."""
+    return CUET_AVAILABLE and isinstance(module, cuet.Linear)
+
+
 def inject_lora(
     module: nn.Module,
     rank: int = 4,
@@ -282,10 +508,23 @@ def inject_lora(
     wrap_dense: bool = True,
     _is_root: bool = True,
 ) -> None:
-    """Recursively replace eligible linears with LoRA-wrapped versions."""
+    """Recursively replace eligible linears with LoRA-wrapped versions.
+
+    Supports both e3nn (o3.Linear) and cueq (cuet.Linear) equivariant layers.
+    """
+    lora_types = (LoRAO3Linear, LoRADenseLinear, LoRAFCLayer, LoRACuETLinear)
     for child_name, child in list(module.named_children()):
         # Skip already wrapped
-        if isinstance(child, (LoRAO3Linear, LoRADenseLinear, LoRAFCLayer)):
+        if isinstance(child, lora_types):
+            continue
+        # cuequivariance Linear (must be checked before o3.Linear since
+        # cuet.Linear is also an nn.Module but not an o3.Linear)
+        if wrap_equivariant and _is_cuet_linear(child):
+            try:
+                wrapped = LoRACuETLinear(child, rank=rank, alpha=alpha)
+            except ValueError:
+                continue
+            setattr(module, child_name, wrapped)
             continue
         # Equivariant o3.Linear
         if wrap_equivariant and isinstance(child, o3.Linear):
@@ -294,6 +533,7 @@ def inject_lora(
             except ValueError:  # If no shared irreps, skip
                 continue
             setattr(module, child_name, wrapped)
+            continue
         # Dense nn.Linear
         if wrap_dense and isinstance(child, nn.Linear):
             wrapped = LoRADenseLinear(child, rank=rank, alpha=alpha)
@@ -326,6 +566,7 @@ def merge_lora_weights(model: nn.Module, inplace: bool = True) -> nn.Module:
     - LoRADenseLinear -> nn.Linear (with merged weights)
     - LoRAFCLayer -> e3nn _Layer (with merged weights)
     - LoRAO3Linear -> o3.Linear (with merged weights)
+    - LoRACuETLinear -> cuet.Linear (with merged weights)
 
     Args:
         model: Model containing LoRA layers to merge.
@@ -342,7 +583,10 @@ def merge_lora_weights(model: nn.Module, inplace: bool = True) -> nn.Module:
 
     def merge_recursive(module: nn.Module) -> None:
         for name, child in list(module.named_children()):
-            if isinstance(child, (LoRADenseLinear, LoRAFCLayer, LoRAO3Linear)):
+            if isinstance(
+                child,
+                (LoRADenseLinear, LoRAFCLayer, LoRAO3Linear, LoRACuETLinear),
+            ):
                 setattr(module, name, child.merge_into_base())
             else:
                 merge_recursive(child)
